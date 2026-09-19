@@ -1,0 +1,21 @@
+node_modules/
+dist/
+.env
+.env.*
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+frontend/dist/
+static/
+.superpowers/
+
+data/
+
+# Internal planning docs — not for distribution
+docs/

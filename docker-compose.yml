@@ -1,0 +1,36 @@
+services:
+  plex-support:
+    build: .
+    container_name: plex-support
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3080}:8000"
+    environment:
+      - PLEX_TOKEN=${PLEX_TOKEN}
+      - PLEX_SERVER_URL=${PLEX_SERVER_URL:-http://localhost:32400}
+      - SONARR_URL=${SONARR_URL}
+      - SONARR_API_KEY=${SONARR_API_KEY}
+      - RADARR_URL=${RADARR_URL}
+      - RADARR_API_KEY=${RADARR_API_KEY}
+      - DISCORD_WEBHOOK_URL=${DISCORD_WEBHOOK_URL}
+      - TAUTULLI_URL=${TAUTULLI_URL}
+      - TAUTULLI_API_KEY=${TAUTULLI_API_KEY}
+      - SESSION_SECRET=${SESSION_SECRET}
+      - SECURE_COOKIE=${SECURE_COOKIE}
+      - REQUEST_URL=${REQUEST_URL}
+      - HIDDEN_LIBRARIES=${HIDDEN_LIBRARIES}
+      # Push notifications. Unset means push is off and everything else works
+      # as before. The .p8 lives under data/, which is already bind-mounted and
+      # already gitignored, so it needs no mount of its own.
+      - APNS_KEY_PATH=${APNS_KEY_PATH}
+      - APNS_KEY_ID=${APNS_KEY_ID}
+      - APNS_TEAM_ID=${APNS_TEAM_ID}
+      - APNS_BUNDLE_ID=${APNS_BUNDLE_ID}
+      - APNS_USE_SANDBOX=${APNS_USE_SANDBOX}
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/api/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
