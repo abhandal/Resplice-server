@@ -60,6 +60,12 @@ async def startup():
     await _ensure_admin_id()
     await refresh_library_cache()
 
+    # Pick up fixes that were still running when the server last stopped, so a
+    # restart mid-download doesn't leave the user waiting for a push that can
+    # no longer fire.
+    from backend.fix import resume_queue
+    await resume_queue()
+
     async def _refresh_loop():
         while True:
             await asyncio.sleep(300)  # 5 minutes

@@ -1,13 +1,15 @@
 import asyncio
+import json
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, fields
+from pathlib import Path
 
 from fastapi import APIRouter, Request, HTTPException
 
 import httpx
 
-from backend import sonarr, radarr
+from backend import fsutil, sonarr, radarr
 from backend.plex_auth import require_user, get_all_users, get_user_sections
 from backend.search import _item_accessible, _section_paths, _build_section_paths
 from backend.rate_limit import check_rate_limit, record_request
@@ -32,7 +34,8 @@ class FixRequest:
     status: str = "searching"  # searching, downloading, importing, done, available, stuck
     progress: float = 0
     stuck_reason: str = ""
-    notified: bool = False
+    notified: bool = False          # admin was told this fix is stuck
+    push_sent: bool = False         # "ready to watch" push already delivered
     created_at: float = field(default_factory=time.time)
     episode_id: int = 0
     movie_id: int = 0
@@ -42,11 +45,115 @@ class FixRequest:
 # Global fix queue: fix_id -> FixRequest
 _queue: dict[str, FixRequest] = {}
 
+# The queue is persisted because a fix outlives the request that started it.
+# Losing it to a restart used to mean the tracker died silently and the promised
+# "ready to watch" push never fired, while the download carried on regardless.
+DATA_DIR = Path(__file__).parent.parent / "data"
+DATA_DIR.mkdir(exist_ok=True)
+QUEUE_FILE = DATA_DIR / "queue.json"
+
+# How long a fix is tracked before it is called stuck, and how often it is polled.
+FIX_WINDOW_SECONDS = 1200   # 20 minutes
+POLL_INTERVAL = 10
+
+# Fixes older than this are dropped when the queue is loaded. Everything this old
+# has long since finished or been abandoned; without it the file grows forever.
+QUEUE_MAX_AGE = 24 * 3600
+
+# Nothing more will happen to a fix in one of these states, so no tracker is
+# restarted for it. It stays in the queue so the user can still see the outcome.
+TERMINAL = ("available", "stuck")
+
+
+def _save_queue() -> None:
+    """Write the queue to disk. Best-effort: a failed write must never take down
+    the fix that triggered it."""
+    try:
+        fsutil.write_private_text(
+            QUEUE_FILE,
+            json.dumps({fid: asdict(f) for fid, f in _queue.items()}, indent=2),
+        )
+    except Exception as e:
+        log.warning(f"Failed to save queue: {e}")
+
+
+def _load_queue() -> None:
+    """Restore the queue from disk, dropping anything stale or unreadable."""
+    if not QUEUE_FILE.exists():
+        return
+    try:
+        data = json.loads(QUEUE_FILE.read_text())
+    except Exception as e:
+        log.warning(f"Failed to read queue file: {e}")
+        return
+
+    known = {f.name for f in fields(FixRequest)}
+    now = time.time()
+    for fid, raw in data.items():
+        if not isinstance(raw, dict):
+            continue
+        if now - raw.get("created_at", 0) > QUEUE_MAX_AGE:
+            continue
+        try:
+            # Ignore unknown keys so an older file survives a field being renamed.
+            _queue[fid] = FixRequest(**{k: v for k, v in raw.items() if k in known})
+        except Exception as e:
+            log.warning(f"Skipping unreadable queue entry {fid}: {e}")
+
+
+def _set_status(fix: FixRequest, status: str, reason: str = "") -> None:
+    """Change a fix's status and persist it.
+
+    Progress on its own never triggers a write: it is re-derived from
+    Sonarr/Radarr within one cycle of a restart, so it is not worth the disk.
+    """
+    if fix.status == status and fix.stuck_reason == reason:
+        return
+    fix.status = status
+    if reason:
+        fix.stuck_reason = reason
+    _save_queue()
+
+
+def _remaining_cycles(fix: FixRequest) -> int:
+    """Poll cycles left for this fix.
+
+    Derived from created_at rather than counted, so a fix reloaded after a
+    restart finishes its original window instead of starting a fresh one. A
+    resumed fix always gets at least one cycle: the download may well have
+    completed while the server was down, and looking is the first thing a
+    cycle does.
+    """
+    left = int((FIX_WINDOW_SECONDS - (time.time() - fix.created_at)) / POLL_INTERVAL)
+    return max(1, left)
+
+
+async def resume_queue() -> None:
+    """Load the queue and restart a tracker for every fix still in flight.
+
+    Called once at startup. Terminal fixes are left alone; a fix that was
+    waiting on Plex picks that wait back up, so its push still arrives.
+    """
+    _load_queue()
+    resumed = 0
+    for fix in _queue.values():
+        if fix.status in TERMINAL:
+            continue
+        if fix.status == "done":
+            asyncio.create_task(_wait_for_plex(fix))
+        elif fix.media_type == "episode":
+            asyncio.create_task(_poll_episode(fix))
+        else:
+            asyncio.create_task(_poll_movie(fix))
+        resumed += 1
+    if resumed:
+        log.info(f"Resumed {resumed} in-flight fix(es) from disk")
+
 
 async def _wait_for_plex(fix: FixRequest):
     """Short wait after import — Sonarr/Radarr notify Plex automatically."""
     await asyncio.sleep(15)
-    fix.status = "available"
+    _set_status(fix, "available")
     await _notify_available(fix)
 
 
@@ -57,6 +164,10 @@ async def _notify_available(fix: FixRequest):
     keeping the import local avoids tangling this module's import order.
     A push must never be able to disturb the fix that triggered it.
     """
+    # A restart mid-wait restarts the wait, so without this guard a fix could
+    # announce itself twice.
+    if fix.push_sent:
+        return
     try:
         from backend import devices
         await devices.notify(
@@ -65,6 +176,8 @@ async def _notify_available(fix: FixRequest):
             f"{fix.title} is back on Plex.",
             {"fixId": fix.id, "type": fix.media_type},
         )
+        fix.push_sent = True
+        _save_queue()
     except Exception as e:
         log.warning(f"Push notification failed for {fix.id}: {e}")
 
@@ -97,14 +210,13 @@ async def _poll_episode(fix: FixRequest):
         # Decypharr force-imports stuck downloads itself, so we only observe here:
         # a queue warning means "still assembling / Sonarr will retry", and we wait
         # out the window before declaring stuck.
-        TOTAL_CYCLES = 120      # ~20 minutes
-        for _ in range(TOTAL_CYCLES):
-            await asyncio.sleep(10)
+        for _ in range(_remaining_cycles(fix)):
+            await asyncio.sleep(POLL_INTERVAL)
 
             ep = await sonarr.get(f"/episode/{fix.episode_id}")
             if ep.get("hasFile"):
-                fix.status = "done"
                 fix.progress = 100
+                _set_status(fix, "done")
                 await _wait_for_plex(fix)
                 return
 
@@ -125,7 +237,7 @@ async def _poll_episode(fix: FixRequest):
                 size = matched.get("size", 1)
                 sizeleft = matched.get("sizeleft", 0)
                 fix.progress = max(0, min(100, ((size - sizeleft) / size) * 100)) if size else 0
-                fix.status = "downloading"
+                _set_status(fix, "downloading")
                 continue
 
             warning_strikes += 1
@@ -135,36 +247,32 @@ async def _poll_episode(fix: FixRequest):
 
             # Warning state — the download is present but not imported yet.
             # Decypharr handles the force import; just report progress and wait.
-            fix.status = "importing"
+            _set_status(fix, "importing")
 
         # Loop exhausted without resolution
         if warning_strikes > 0:
-            fix.status = "stuck"
-            fix.stuck_reason = _format_rejections([], last_msgs) or "Import did not complete after 20 minutes"
+            _set_status(fix, "stuck",
+                        _format_rejections([], last_msgs) or "Import did not complete after 20 minutes")
         elif fix.status == "downloading":
-            fix.status = "stuck"
-            fix.stuck_reason = "Download did not complete after 20 minutes"
+            _set_status(fix, "stuck", "Download did not complete after 20 minutes")
         else:
-            fix.status = "stuck"
-            fix.stuck_reason = "Not found after 20 minutes"
+            _set_status(fix, "stuck", "Not found after 20 minutes")
     except Exception as e:
         log.warning(f"Poll episode failed: {e}")
-        fix.status = "stuck"
-        fix.stuck_reason = "An error occurred while tracking this fix"
+        _set_status(fix, "stuck", "An error occurred while tracking this fix")
 
 
 async def _poll_movie(fix: FixRequest):
     try:
         warning_strikes = 0
         last_msgs: list = []
-        TOTAL_CYCLES = 120
-        for _ in range(TOTAL_CYCLES):
-            await asyncio.sleep(10)
+        for _ in range(_remaining_cycles(fix)):
+            await asyncio.sleep(POLL_INTERVAL)
 
             m = await radarr.movie(fix.movie_id)
             if m.get("hasFile"):
-                fix.status = "done"
                 fix.progress = 100
+                _set_status(fix, "done")
                 await _wait_for_plex(fix)
                 return
 
@@ -184,7 +292,7 @@ async def _poll_movie(fix: FixRequest):
                 size = matched.get("size", 1)
                 sizeleft = matched.get("sizeleft", 0)
                 fix.progress = max(0, min(100, ((size - sizeleft) / size) * 100)) if size else 0
-                fix.status = "downloading"
+                _set_status(fix, "downloading")
                 continue
 
             warning_strikes += 1
@@ -193,21 +301,18 @@ async def _poll_movie(fix: FixRequest):
                 last_msgs = msgs
 
             # Decypharr handles the force import — observe only.
-            fix.status = "importing"
+            _set_status(fix, "importing")
 
         if warning_strikes > 0:
-            fix.status = "stuck"
-            fix.stuck_reason = _format_rejections([], last_msgs) or "Import did not complete after 20 minutes"
+            _set_status(fix, "stuck",
+                        _format_rejections([], last_msgs) or "Import did not complete after 20 minutes")
         elif fix.status == "downloading":
-            fix.status = "stuck"
-            fix.stuck_reason = "Download did not complete after 20 minutes"
+            _set_status(fix, "stuck", "Download did not complete after 20 minutes")
         else:
-            fix.status = "stuck"
-            fix.stuck_reason = "Not found after 20 minutes"
+            _set_status(fix, "stuck", "Not found after 20 minutes")
     except Exception as e:
         log.warning(f"Poll movie failed: {e}")
-        fix.status = "stuck"
-        fix.stuck_reason = "An error occurred while tracking this fix"
+        _set_status(fix, "stuck", "An error occurred while tracking this fix")
 
 
 def _is_already_fixing(media_type: str, episode_id: int = 0, movie_id: int = 0) -> bool:
@@ -321,6 +426,7 @@ async def fix_media(request: Request):
         )
 
     _queue[fix_id] = fix
+    _save_queue()
     if not is_admin:
         record_request(user["uid"])
     history.record(
@@ -370,6 +476,7 @@ async def remove_queue_item(request: Request, fix_id: str):
     if fix.user_id != user["uid"]:
         raise HTTPException(403, "Not your fix request")
     del _queue[fix_id]
+    _save_queue()
     return {"ok": True}
 
 
@@ -379,6 +486,7 @@ async def clear_queue(request: Request):
     to_remove = [fid for fid, f in _queue.items() if f.user_id == user["uid"]]
     for fid in to_remove:
         del _queue[fid]
+    _save_queue()
     return {"ok": True, "removed": len(to_remove)}
 
 
@@ -390,6 +498,7 @@ def mark_notified(fix_id: str):
     fix = _queue.get(fix_id)
     if fix:
         fix.notified = True
+        _save_queue()
 
 
 # ---------------------------------------------------------------------------
@@ -637,6 +746,7 @@ async def grab_release(request: Request):
             episode_id=episode_id, series_id=series_id,
         )
         _queue[fix_id] = fix
+        _save_queue()
         asyncio.create_task(_poll_episode(fix))
 
     else:
@@ -681,6 +791,7 @@ async def grab_release(request: Request):
             media_type="movie", title=title, movie_id=movie_id,
         )
         _queue[fix_id] = fix
+        _save_queue()
         asyncio.create_task(_poll_movie(fix))
 
     if not is_admin:
