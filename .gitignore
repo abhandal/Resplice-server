@@ -2,6 +2,8 @@ node_modules/
 dist/
 .env
 .env.*
+# ...but the sample is the documented first step in the README, so it ships.
+!.env.sample
 __pycache__/
 *.pyc
 *.pyo
