@@ -20,8 +20,8 @@ libraries they actually have access to, and non-admin fixes are rate-limited
 - A live queue so users can watch their fix download
 - Watch statistics per user, sourced from Plex history (Tautulli optional)
 - "Notify admin" button for stuck downloads, via a Discord webhook
-- Optional push notifications when a repair finishes (needs a companion iOS
-  app built against the API — not included here)
+- Optional push notifications when a repair finishes — see the note below
+  before counting on these
 
 ## Requirements
 
@@ -80,12 +80,33 @@ Secure. Auth is handled by Plex itself via PIN sign-in, so there are no
 passwords to manage, and accounts unshared from your Plex server lose access
 here within a few minutes.
 
+## Push notifications need your own iOS app
+
+The `APNS_*` settings exist, but they will not let you push to **Resplice on
+the App Store**. An APNs key can only send to bundle identifiers owned by the
+Apple developer team that created it, so only that app's publisher can push to
+it. There is no setting that changes this and no key that can be shared.
+
+What this means in practice:
+
+- Resplice from the App Store works fine against your server — search, fixing,
+  the queue, sign-in, statistics. It just never pushes.
+- The app asks `/api/health` whether push is configured and stays quiet if it
+  is not, so your users are never prompted to allow notifications that could
+  never arrive.
+- To get push you need your own iOS client, your own bundle identifier, and
+  your own APNs key from your own paid Apple developer account. The `APNS_*`
+  settings are there for exactly that case.
+- The web app has no push of its own yet, so it is not a way around this.
+
+Leave the `APNS_*` values blank and push is simply off; nothing else changes.
+
 ## Good to know
 
-- The fix queue lives in memory. If the container restarts mid-repair, the
-  download itself continues in Sonarr/Radarr and imports normally — but the
-  progress entry vanishes from the queue and no completion notification is
-  sent.
+- The fix queue survives restarts. It is written to `data/queue.json`, and
+  anything still in flight is picked back up when the container starts, so a
+  restart mid-repair keeps both the progress entry and the completion
+  notification.
 - One Sonarr and one Radarr instance. No 4K-instance split yet.
 - One stats view buckets movie watch time under a library named "Movies";
   if your movie library is named something else that row will be off.
