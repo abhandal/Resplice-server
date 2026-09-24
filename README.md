@@ -41,21 +41,46 @@ cd Resplice-server
 cp .env.sample .env
 ```
 
-Fill in `.env`. The required values:
+### Required
 
-| Variable | What it is |
-|---|---|
-| `PLEX_TOKEN` | An admin token for your Plex server. [Finding yours](https://support.plex.tv/articles/204059436). **Whoever owns this token is the admin account** — sign in with that Plex account and you get the admin pages. |
-| `PLEX_SERVER_URL` | Your server as reachable *from inside the container*. Not `localhost` — that's the container itself. Use the host's LAN IP or a Docker network hostname. |
-| `SONARR_URL`, `SONARR_API_KEY` | Sonarr address and its API key (Settings → General). |
-| `RADARR_URL`, `RADARR_API_KEY` | Same for Radarr. |
-| `SESSION_SECRET` | Encrypts Plex tokens at rest. Generate with `openssl rand -hex 32`. The app refuses to start without it. |
+| Variable | Secret | What it is |
+|---|---|---|
+| `PLEX_TOKEN` | yes | An admin token for your Plex server. [Finding yours](https://support.plex.tv/articles/204059436). **Whoever owns this token is the admin account** — sign in with that Plex account and you get the admin pages. |
+| `PLEX_SERVER_URL` | no | Your server as reachable *from inside the container*. Not `localhost` — that's the container itself. Use the host's LAN IP or a Docker network hostname. |
+| `SONARR_URL` | no | Sonarr's address. |
+| `SONARR_API_KEY` | yes | Sonarr → Settings → General. |
+| `RADARR_URL` | no | Radarr's address. |
+| `RADARR_API_KEY` | yes | Radarr → Settings → General. |
+| `SESSION_SECRET` | yes | Encrypts Plex tokens at rest. Generate with `openssl rand -hex 32`. The app refuses to start without it. |
 
-Everything else in the sample is optional and documented inline: a Discord
-webhook for stuck-download pings, Tautulli for richer stats, a request-system
-URL (Overseerr, Jellyseerr, Ombi) to link to when someone searches for a
-movie you don't have, and `HIDDEN_LIBRARIES` to keep libraries out of the
-stats pages.
+### Optional
+
+Leave any of these blank and the feature it belongs to stays off. Nothing
+else changes.
+
+| Variable | Secret | What it turns on |
+|---|---|---|
+| `DISCORD_WEBHOOK_URL` | yes | The "notify admin" button on a stuck download. Blank and the button reports it's unavailable. |
+| `TAUTULLI_URL` | no | Richer watch statistics. Blank falls back to Plex's own history. |
+| `TAUTULLI_API_KEY` | yes | Goes with the above. |
+| `REQUEST_URL` | no | Links to your request system (Overseerr, Jellyseerr, Ombi) when someone searches for something you don't have. Blank hides the links. |
+| `HIDDEN_LIBRARIES` | no | Comma-separated library names to keep out of recently-watched and stats. |
+| `SECURE_COOKIE` | no | Marks session cookies Secure. Set `true` if you serve over HTTPS; leave blank for plain-HTTP LAN use. |
+| `PORT` | no | Host port to publish on. Defaults to 3080. |
+
+### Optional — push notifications
+
+**Only useful if you build your own iOS app.** These cannot push to Resplice
+on the App Store — see [Push notifications](#push-notifications-need-your-own-ios-app)
+below for why. Leave the whole block blank otherwise.
+
+| Variable | Secret | What it is |
+|---|---|---|
+| `APNS_KEY_PATH` | the `.p8` it points at is | Path to your APNs key inside the container, e.g. `/app/data/apns/AuthKey_XXXXXXXXXX.p8`. Anyone holding that file can push to your apps. |
+| `APNS_KEY_ID` | no | The key's ID, from the developer portal. |
+| `APNS_TEAM_ID` | no | Your Apple developer team ID. |
+| `APNS_BUNDLE_ID` | no | The bundle identifier of your own iOS build. |
+| `APNS_USE_SANDBOX` | no | `true` while testing a development build; blank for TestFlight and App Store builds. |
 
 Then:
 
